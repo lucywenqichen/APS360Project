@@ -17,7 +17,7 @@ import shutil
 from google.colab import drive
 drive.mount('/content/drive')
 
-# 256 by 256 images, this models the encoder (reduce dimensionality, create an embedding, classify embeddings)
+# 256 by 256 images, this models the encoder (reduce dimensionality, create an embedding, push similar embeddings together)
 class CNN(nn.Module):
   def __init__(self):
     super(CNN, self).__init__()
@@ -31,7 +31,7 @@ class CNN(nn.Module):
     self.fc2 = nn.Linear(512, 256)
 
   def forward(self, x):
-    x = self.pool(F.relu(self.conv1(x))) #256 -> 127
+    x = self.pool(F.relu(self.conv1(x))) #dimensions: 256 -> 127
     x = self.pool(F.relu(self.conv2(x))) #127 -> 62
     x = self.pool(F.relu(self.conv3(x))) #62 -> 30
     x = self.pool(F.relu(self.conv4(x))) #30 -> 14
@@ -44,7 +44,7 @@ class simCLR(nn.Module):
   def __init__(self, baseencoder, projection_dim = 256):
     super(simCLR, self).__init__()
     self.name = 'simCLR'
-    self.encoder = baseencoder
+    self.encoder = baseencoder # pass miniCNN as the baseencoder
     self.projection_dim = projection_dim
     self.projection = nn.Sequential(
         nn.Linear(256, 256), nn.ReLU(),
@@ -54,7 +54,7 @@ class simCLR(nn.Module):
     projections = self.projection(features)
     return projections
 
-# create augmentations to train weights to push similar images together
+# create 2 augmentations per image (positive examples)
 class simCLRsample(torch.utils.data.Dataset):
   def __init__(self, image_paths, transform):
     self.image_paths = image_paths
@@ -75,7 +75,7 @@ simclr_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))])
 
-# simCLR loss function
+# simCLR loss function (for unsupervised learning)
 def lossfunction(z1, z2, temperature = 0.5):
   z1 = F.normalize(z1, dim = 1)
   z2 = F.normalize(z2, dim = 1)
@@ -93,7 +93,7 @@ def lossfunction(z1, z2, temperature = 0.5):
 miniCNN = CNN()
 simclr = simCLR(miniCNN)
 
-
+# extract embeddings
 from os import pathconf_names
 # get vectors from final layer
 def extract(modelname, img_paths, device, batch_size = 5):
@@ -124,7 +124,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = CNN().to(device)
 
 import os
-image_folder = '/content/drive/MyDrive/APS360/images'
+image_folder = '/content/drive/MyDrive/APS360/images' # source folder
 image_paths = [os.path.join(image_folder, f) for f in os.listdir(image_folder) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
 # print(image_paths)
 features = extract(simclr, image_paths, device)
@@ -182,13 +182,13 @@ train(simclr, dataloader, 20, 0.001, 20, 0.5)
 
 # sort images into 32 clusters
 k = 32
-features = extract(simclr, image_paths, device)
+features = extract(simclr, image_paths, device) # extract features after model has been trained
 kmeans = KMeans(n_clusters=k, random_state=42)
 cluster_labels = kmeans.fit_predict(features)
 print(f"Assigned labels: {cluster_labels}")
 print(image_paths[0])
 print(len(image_paths), len(cluster_labels))
-output = '/content/drive/MyDrive/APS360/APS360Project/miniCNN/contrastiveclusters'
+output = '/content/drive/MyDrive/APS360/APS360Project/miniCNN/contrastiveclusters' # dest folder
 os.makedirs(output, exist_ok=True)
 for imgpath, label in zip(image_paths, cluster_labels):
   clusterfolder = os.path.join(output, f"cluster_{label}")
