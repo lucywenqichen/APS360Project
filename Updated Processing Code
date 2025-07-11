@@ -1,0 +1,93 @@
+# Start with importing modules that may be required
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import os
+import matplotlib.pyplot as plt
+import h5py
+
+from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader, random_split
+from PIL import Image
+from tqdm import tqdm
+from skimage.color import lab2rgb
+from skimage import color, io
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'  # Fixes a bug with PyTorch and MKL
+
+def preprocess(image_path, save_path):
+  '''
+  Preprocesses an image by converting it to the Lab color space and normalizing the pixel values.
+  '''
+  try:
+    image = io.imread(image_path)
+    lab = color.rgb2lab(image).astype(np.float16)
+    L = lab[:, :, 0:1] / 100.0
+    ab = lab[:, :, 1:] / 128.0
+
+    L_tensor = torch.from_numpy(L).permute(2, 0, 1).contiguous()
+    ab_tensor = torch.from_numpy(ab).permute(2, 0, 1).contiguous()
+
+    torch.save({'L': L_tensor, 'ab': ab_tensor}, save_path)
+
+  except Exception as e:
+    print(f"Error processing image {image_path}: {e}")
+
+'''
+Due to the number of images needed to be processed, it is likely that Google Colab will time out before completing the whole analysis
+As such, one helpful function would be a function that can determine which photo
+'''
+
+def find_missing_files(folder_path, number_of_files):
+  '''
+  Returns the missing photos/tensors in a folder as a list and the index of the first missing tensor
+  (or just an empty list if no tensors are missing).
+  Variables:
+    folder_path: the directory for the folder that we wish to examine its contents
+    number_of_files: total number of files expected in the folder. The dataset is labeled using the following string format: {i:07}.(png or pt), starting from 0000000.__.
+  '''
+  missing_photos = []
+
+  try:
+    for i in tqdm(range(0, number_of_files)):
+      # check if the image associated with the number is present
+      if os.path.exists(folder_path + f"/{i:07}.pt") or os.path.exists(folder_path + f"/{i:07}.png"):
+        continue
+      else:
+        missing_photos.append(i)
+    if len(missing_photos) > 0: #
+      return missing_photos[0], missing_photos
+    else:
+      return None, missing_photos
+
+  except Exception as e:
+    print(f"Error running function: {e}")
+
+if __name__ ==  '__main__':
+  # The following two lines define the input (image) folder and output (tensor) folder. It can be altered depending on the directories wished to be used.
+  # For the purpose of this code, the directories used by Joshua Chung to process the photos will be kept
+  input_folder = "/content/drive/MyDrive/APS360/Project_Data/lhq_256"
+  output_folder = "/content/drive/MyDrive/APS360/Project_Data/full_tensors"
+
+  print("Checking input folder...")
+  starting_index_photos, list_of_missing_photos = find_missing_files(input_folder, 90000)
+  if starting_index_photos != None:
+    print(f"\nMissing Images! Check Folder for the following photos:\n{list_of_missing_photos}")
+  else:
+    print("Checking output folder...")
+    starting_index_tensors, list_of_missing_tensors = find_missing_files(output_folder, 90000)
+    if starting_index_tensors == None:
+      print("\n All tensors are processed")
+    else:
+      for i in tqdm(range(starting_index_tensors, 90000)):
+        filename = f"{i:07}.png"
+        image_path = os.path.join(input_folder, filename)
+        save_path = os.path.join(output_folder, filename.rsplit('.', 1)[0] + '.pt') # gets name without file extension and adds .pt
+        preprocess(image_path, save_path)
+      print("Finished processing all tensors")
