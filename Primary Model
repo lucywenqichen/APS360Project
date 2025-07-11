@@ -14,16 +14,25 @@ from skimage.color import lab2rgb
 from skimage import color, io
 from collections import Counter
 
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'  # Fixes a bug with PyTorch and MKL
+# Allow PyTorch and MKL to coexist (fixes a common bug)
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
 from google.colab import drive
 drive.mount('/content/drive')
 
 class ImageDataset(Dataset):
+    """
+    Custom PyTorch Dataset for loading preprocessed LAB image tensors.
+    Each sample contains:
+      - L: Lightness channel (normalized)
+      - ab: Color channels (normalized)
+      - labels: Quantized ab bin indices for classification
+    """
     def __init__(self, tensor_dir, ab_grid, transform=None):
         self.tensor_dir = tensor_dir
         self.ab_grid = ab_grid
         self.transform = transform
+        # Only include .pt files (ignore hidden files)
         self.tensor_files = [f for f in os.listdir(tensor_dir) if f.lower().endswith('.pt') and not f.startswith('.')]
 
     def __len__(self):
@@ -35,57 +44,59 @@ class ImageDataset(Dataset):
             tensor = torch.load(tensor_path)
         except Exception as e:
             print(f"Skipping file {tensor_path}: {e}")
-            # Optionally, skip to the next file or raise an error
             raise
-
-        L = tensor['L']
-        ab = tensor['ab']
-        labels = ab_to_classes(ab, self.ab_grid)
-
+        
+        L = tensor['L']  # [1, H, W], normalized
+        ab = tensor['ab']  # [2, H, W], normalized
+        labels = ab_to_classes(ab, self.ab_grid)  # [H, W], quantized
         return L.float(), ab.float(), labels.long()
 
 class ColorizationNet(nn.Module):
+    """
+    Simple U-Net style encoder-decoder for image colorization.
+    Input: L channel (grayscale)
+    Output: Per-pixel classification over quantized ab bins
+    """
     def __init__(self, num_classes):
         super(ColorizationNet, self).__init__()
-        # Encoder:
-        self.enc_conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1) # (1, 1024, 1024) -> (64, 1024, 1024)
+        # Encoder layers
+        self.enc_conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1)
         self.enc_bn1 = nn.BatchNorm2d(64)
-
-        self.enc_conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1) # (64, 1024, 1024) -> (128, 512, 512)
+        
+        self.enc_conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
         self.enc_bn2 = nn.BatchNorm2d(128)
-
-        self.enc_conv3 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1) # (128, 512, 512) -> (256, 256, 256)
+        
+        self.enc_conv3 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)
         self.enc_bn3 = nn.BatchNorm2d(256)
-
-        self.enc_conv4 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1) # (256, 256, 256) -> (512, 128, 128)
+        
+        self.enc_conv4 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1)
         self.enc_bn4 = nn.BatchNorm2d(512)
-
-        # skip connections
-        self.skip1 = nn.Conv2d(256, 256, kernel_size = 1)
-        self.skip2 = nn.Conv2d(128, 128, kernel_size = 1)
-        self.skip3 = nn.Conv2d(64, 64, kernel_size = 1)
-
-        # Decoder:
-        self.dec_conv1 = nn.ConvTranspose2d(512, 256, kernel_size=3, stride=2, padding=1, output_padding=1) # (512, 128, 128) -> (256, 256, 256)
+        
+        # Skip connections (1x1 convs)
+        self.skip1 = nn.Conv2d(256, 256, kernel_size=1)
+        self.skip2 = nn.Conv2d(128, 128, kernel_size=1)
+        self.skip3 = nn.Conv2d(64, 64, kernel_size=1)
+        
+        # Decoder layers
+        self.dec_conv1 = nn.ConvTranspose2d(512, 256, kernel_size=3, stride=2, padding=1, output_padding=1)
         self.dec_bn1 = nn.BatchNorm2d(256)
-
-        self.dec_conv2 = nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1) # (256, 256, 256) -> (128, 512, 512)
+        
+        self.dec_conv2 = nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1)
         self.dec_bn2 = nn.BatchNorm2d(128)
-
-        self.dec_conv3 = nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1) # (128, 512, 512) -> (64, 1024, 1024)
+        
+        self.dec_conv3 = nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1)
         self.dec_bn3 = nn.BatchNorm2d(64)
-
-        # predict softmax oover quantized color bins per pixel
-        self.final_conv = nn.Conv2d(64, num_classes, kernel_size=1) # (64, 1024, 1024) -> (2, 1024, 1024)
+        
+        # Final classifier: outputs logits for each ab bin
+        self.final_conv = nn.Conv2d(64, num_classes, kernel_size=1)
 
     def forward(self, x):
-        # Encoder:
+        # Encoder
         x1 = F.relu(self.enc_bn1(self.enc_conv1(x)))
         x2 = F.relu(self.enc_bn2(self.enc_conv2(x1)))
         x3 = F.relu(self.enc_bn3(self.enc_conv3(x2)))
         x4 = F.relu(self.enc_bn4(self.enc_conv4(x3)))
-
-        # Decoder:
+        # Decoder with skip connections
         y1 = F.relu(self.dec_bn1(self.dec_conv1(x4)))
         y1 = y1 + self.skip1(x3)
 
@@ -94,12 +105,16 @@ class ColorizationNet(nn.Module):
 
         y3 = F.relu(self.dec_bn3(self.dec_conv3(y2)))
         y3 = y3 + self.skip3(x1)
-
-        # Output layer:
+        
+        # Output logits
         out = self.final_conv(y3)
         return out
 
-def create_ab_grid(num_bins = 18, ab_range = 110):
+def create_ab_grid(num_bins=18, ab_range=110):
+    """
+    Create a grid of quantized ab color values for classification.
+    Returns: [num_bins*num_bins, 2] numpy array of ab values
+    """
     a_vals = np.linspace(-ab_range, ab_range, num_bins)
     b_vals = np.linspace(-ab_range, ab_range, num_bins)
 
@@ -108,26 +123,35 @@ def create_ab_grid(num_bins = 18, ab_range = 110):
     return ab_grid
 
 def ab_to_classes(ab, ab_grid):
-    ab = ab.float()  # Ensure ab is float32
-    ab_flat = ab.permute(1, 2, 0).reshape(-1, 2)
+    """
+    Map ab values to nearest quantized bin index for classification.
+    ab: [2, H, W] tensor (normalized)
+    ab_grid: [num_bins*num_bins, 2] numpy array
+    Returns: [H, W] tensor of class indices
+    """
+    ab = ab.float()
+    ab_flat = ab.permute(1, 2, 0).reshape(-1, 2)  # [H*W, 2]
     dists = torch.cdist(ab_flat.unsqueeze(0), torch.from_numpy(ab_grid).float().unsqueeze(0)).squeeze(0)
     labels = dists.argmin(dim=1)
-    return labels.reshape(256, 256)
+    return labels.reshape(ab.shape[1], ab.shape[2])
 
 def preprocess_image(image_path, save_path, ab_grid):
+    """
+    Convert an RGB image to LAB, normalize, and save as a tensor dict.
+    """
     image = io.imread(image_path)
     lab = color.rgb2lab(image)
     L = lab[:, :, 0]
     ab = lab[:, :, 1:]
-
-    L = torch.from_numpy(L).unsqueeze(0) / 100.0  # (1, H, W)
-    ab = torch.from_numpy(ab).permute(2, 0, 1) / 128.0  # (2, H, W)
-
-    label = ab_to_classes(ab, ab_grid)
-
+    L = torch.from_numpy(L).unsqueeze(0) / 100.0  # [1, H, W], normalized
+    ab = torch.from_numpy(ab).permute(2, 0, 1) / 128.0  # [2, H, W], normalized
+    label = ab_to_classes(ab, ab_grid)  # [H, W]
     torch.save({'L': L, 'ab': ab, 'label': label}, save_path)
 
 def accuracy(model, device, loader, ab_grid):
+    """
+    Strict accuracy: percent of pixels where predicted bin matches ground truth bin.
+    """
     model.eval()
     correct = 0
     total = 0
@@ -142,10 +166,12 @@ def accuracy(model, device, loader, ab_grid):
 
             correct += (preds == labels).sum().item()
             total += labels.numel()
-
     return correct / total
 
-def train(model, device, ab_grid, train_loader, val_loader, num_epochs = 5, lr = 0.001):
+def train(model, device, ab_grid, train_loader, val_loader, num_epochs=5, lr=0.001):
+    """
+    Train the colorization model and track loss/accuracy.
+    """
     model.to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -153,7 +179,6 @@ def train(model, device, ab_grid, train_loader, val_loader, num_epochs = 5, lr =
     iters, losses, train_acc, val_acc = [], [], [], []
     n = 0
 
-    # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.5)
 
     for epoch in tqdm(range(num_epochs)):
         model.train()
@@ -166,24 +191,25 @@ def train(model, device, ab_grid, train_loader, val_loader, num_epochs = 5, lr =
             loss = criterion(output, labels)
             loss.backward()
             optimizer.step()
-            # scheduler.step()
             iters.append(n)
             losses.append(loss.item())
             n += 1
-
+            
+        # Evaluate after each epoch
         train_acc.append(accuracy(model, device, train_loader, ab_grid))
         val_acc.append(accuracy(model, device, val_loader, ab_grid))
         print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}, Train Acc: {train_acc[-1]:.4f}, Val Acc: {val_acc[-1]:.4f}")
-
+        
+        # Optionally save model every 5 epochs
         if epoch % 5 == 0:
-          torch.save(model.state_dict(), f"model_epoch{epoch}")
-
+            torch.save(model.state_dict(), f"model_epoch{epoch}")
+            
     print(f"Training complete")
     max_val_epoch = val_acc.index(max(val_acc))
     print(f"Best validation accuracy: {max(val_acc):.4f} at epoch {max_val_epoch}")
     print(f"Corresponding training accuracy: {train_acc[max_val_epoch]:.4f}")
-
-    # plot loss and accuracy
+    
+    # Plot loss and accuracy curves
     plt.figure(figsize=(12, 5))
 
     plt.subplot(1, 2, 1)
@@ -203,29 +229,33 @@ def train(model, device, ab_grid, train_loader, val_loader, num_epochs = 5, lr =
     plt.show()
 
 def class_to_ab(labels, ab_grid):
-  flat_labels = labels.view(-1).cpu().numpy()
-  ab = ab_grid[flat_labels]
-  ab = ab.reshape(labels.shape[0], labels.shape[1], labels.shape[2], 2)
-  ab = ab.transpose(0, 3, 1, 2)  # [batch, 2, H, W]
-  return torch.from_numpy(ab).float() / 128
-
+    """
+    Convert class indices to ab values using the quantized grid.
+    labels: [batch, H, W] tensor
+    ab_grid: [num_bins*num_bins, 2] numpy array
+    Returns: [batch, 2, H, W] tensor (normalized)
+    """
+    flat_labels = labels.view(-1).cpu().numpy()
+    ab = ab_grid[flat_labels]
+    ab = ab.reshape(labels.shape[0], labels.shape[1], labels.shape[2], 2)
+    ab = ab.transpose(0, 3, 1, 2)  # [batch, 2, H, W]
+    return torch.from_numpy(ab).float() / 128
 
 def lab_to_rgb(L, ab):
     """
-    Converts L and ab tensors to a numpy RGB image.
-    Assumes input tensors are in shape: [1, H, W] for L and [2, H, W] for ab
-    and values are normalized to [-1, 1] or [0, 1]
+    Convert normalized L and ab tensors to an RGB image (numpy array).
+    L: [1, H, W], ab: [2, H, W] (normalized)
+    Returns: [H, W, 3] RGB image in [0, 1]
     """
     L = L[0].cpu().numpy() * 100  # L ∈ [0, 1] → [0, 100]
-    ab = ab.cpu().numpy() * 128   # ab ∈ [-1, 1] → [-100, 100]
-
+    ab = ab.cpu().numpy() * 128   # ab ∈ [-1, 1] → [-128, 128]
     lab = np.concatenate((L[np.newaxis, :, :], ab), axis=0).transpose(1, 2, 0)
     rgb = color.lab2rgb(lab)
     return np.clip(rgb, 0, 1)
 
 def visualize_predictions(model, dataloader, device, ab_grid, num_images=5):
     """
-    Displays grayscale input, model output, and ground truth colorization side-by-side.
+    Display grayscale input, model output, and ground truth colorization side-by-side.
     """
     model.eval()
     images_shown = 0
@@ -246,8 +276,8 @@ def visualize_predictions(model, dataloader, device, ab_grid, num_images=5):
                 input_L = L[i]
                 pred_labels = preds[i]
                 gt_labels = labels[i]
-
-                pred_ab = class_to_ab(pred_labels, ab_grid)
+                
+                pred_ab = class_to_ab(pred_labels.unsqueeze(0), ab_grid)[0]
                 gt_ab = ab_true[i]
 
                 input_rgb = lab_to_rgb(input_L, torch.zeros_like(pred_ab))
@@ -272,10 +302,13 @@ def visualize_predictions(model, dataloader, device, ab_grid, num_images=5):
 
                 images_shown += 1
 
+if __name__ == "__main__":
+    # Set up ab grid and data paths
     ab_grid = create_ab_grid()
     image_folder = "/content/drive/MyDrive/APS360Project/ProjectData/primarymodel-mishal/minidataset"
     tensor_folder = "/content/drive/MyDrive/APS360Project/ProjectData/primarymodel-mishal/minidataset_classification_tensors"
-
+    
+    # Preprocessing (commented out if already done)
     # image_files = [f for f in os.listdir(image_folder) if f.endswith(('.jpg', '.jpeg', '.png'))]
     # print("number of images: ", len(image_files))
     # for i, image_file in enumerate(image_files):
@@ -286,7 +319,8 @@ def visualize_predictions(model, dataloader, device, ab_grid, num_images=5):
     #     if i % 50 == 0:
     #         print(f"{i}/{len(image_files)}")
     # print("preprocessing complete")
-
+    
+    # Load dataset and split
     dataset = ImageDataset(tensor_folder, ab_grid)
 
     train_size = int(0.8 * len(dataset))
@@ -295,11 +329,14 @@ def visualize_predictions(model, dataloader, device, ab_grid, num_images=5):
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=4, shuffle=True)
-
+    
+    # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
 
+    # Initialize and train model
     model = ColorizationNet(num_classes=len(ab_grid))
     train(model, device, ab_grid, train_loader, val_loader, num_epochs=25, lr=0.001)
-
+    
+    # Visualize predictions
     visualize_predictions(model, val_loader, device, ab_grid)
