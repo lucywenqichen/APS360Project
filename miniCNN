@@ -177,8 +177,31 @@ def train(model, dataloader, batch_size, learningrate = 0.001, epochs = 10, temp
   np.savetxt("{}_train_loss.csv".format(model_path), train_loss)
 
 
-train(simclr, dataloader, 20, 0.001, 20, 0.5)
+def plot_training_curve(path):
+    train_loss = np.loadtxt("{}_train_loss.csv".format(path))
+    n = len(train_loss) # number of epochs
+    plt.title("Train Loss")
+    plt.plot(range(1,n+1), train_loss, label="Train Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend(loc='best')
+    plt.show()
 
+# train with different parameters
+train(simclr, dataloader, 20, 0.001, 20, 0.5)
+train(simclr, dataloader, 20, 0.0001, 30, 0.5) # best
+train(simclr, dataloader, 20, 0.001, 30, 0.5)
+train(simclr, dataloader, 10, 0.001, 20, 0.5)
+
+# plot training curves
+path1 = get_model_name(simclr.name, 10, 0.001, 19)
+path2 = get_model_name(simclr.name, 20, 0.001, 19)
+path3 = get_model_name(simclr.name, 20, 0.001, 29)
+path4 = get_model_name(simclr.name, 20, 0.0001, 29)
+plot_training_curve(path1)
+plot_training_curve(path2)
+plot_training_curve(path3)
+plot_training_curve(path4)
 
 # sort images into 32 clusters
 k = 32
