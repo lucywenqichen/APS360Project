@@ -1,0 +1,35 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from PIL import Image
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+folder = "/content/drive/MyDrive/APS360/Project_Data"
+subfolder =  "/content/drive/MyDrive/APS360/Project_Data/Grayscale_Photos"
+
+os.makedirs(subfolder, exist_ok=True)
+
+#convert from colour to grayscale (from Tutorial 3)
+def rgb2gray(rgb):
+  return np.dot(rgb[...,:3], [0.299, 0.587, 0.144])
+
+for img in os.listdir(folder):
+  if img == "Grayscale_Photos":
+    continue
+  image_path = os.path.join(folder, img)
+  image = Image.open(image_path)
+  gray_image = image.convert('L')
+
+  plt.imshow(gray_image)
+
+  #convert from colour to grayscale (from Tutorial 3)
+  # img_gray = rgb2gray(image_array)
+  # gray_image = Image.fromarray(img_gray.astype(np.uint8))
+
+  # Define output file path
+  file_path = os.path.join(subfolder, f"grayscale_{img}")
+   
+  # Save the image
+  gray_image.save(file_path)
