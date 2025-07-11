@@ -12,3 +12,189 @@ from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 import shutil
+
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+# 256 by 256 images, this models the encoder (reduce dimensionality, create an embedding, classify embeddings)
+class CNN(nn.Module):
+  def __init__(self):
+    super(CNN, self).__init__()
+    self.name = 'miniCNN'
+    self.conv1 = nn.Conv2d(3, 16, 3)
+    self.pool = nn.MaxPool2d(2, 2)
+    self.conv2 = nn.Conv2d(16, 32, 3)
+    self.conv3 = nn.Conv2d(32, 64, 3)
+    self.conv4 = nn.Conv2d(64, 128, 3)
+    self.fc1 = nn.Linear(128*14*14, 512)
+    self.fc2 = nn.Linear(512, 256)
+
+  def forward(self, x):
+    x = self.pool(F.relu(self.conv1(x))) #256 -> 127
+    x = self.pool(F.relu(self.conv2(x))) #127 -> 62
+    x = self.pool(F.relu(self.conv3(x))) #62 -> 30
+    x = self.pool(F.relu(self.conv4(x))) #30 -> 14
+    x = torch.flatten(x, start_dim = 1)
+    x = F.relu(self.fc1(x))
+    x = F.relu(self.fc2(x))
+    return x
+
+class simCLR(nn.Module):
+  def __init__(self, baseencoder, projection_dim = 256):
+    super(simCLR, self).__init__()
+    self.name = 'simCLR'
+    self.encoder = baseencoder
+    self.projection_dim = projection_dim
+    self.projection = nn.Sequential(
+        nn.Linear(256, 256), nn.ReLU(),
+        nn.Linear(256, self.projection_dim))
+  def forward(self, x):
+    features = self.encoder(x)
+    projections = self.projection(features)
+    return projections
+
+# create augmentations to train weights to push similar images together
+class simCLRsample(torch.utils.data.Dataset):
+  def __init__(self, image_paths, transform):
+    self.image_paths = image_paths
+    self.transform = transform
+  def __len__(self):
+    return len(self.image_paths)
+  def __getitem__(self, idx):
+    img = Image.open(self.image_paths[idx]).convert('RGB')
+    img1 = self.transform(img)
+    img2 = self.transform(img)
+    return img1, img2
+
+simclr_transform = transforms.Compose([
+    transforms.RandomResizedCrop(256),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
+    transforms.RandomGrayscale(p=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))])
+
+# simCLR loss function
+def lossfunction(z1, z2, temperature = 0.5):
+  z1 = F.normalize(z1, dim = 1)
+  z2 = F.normalize(z2, dim = 1)
+  batch_size = z1.shape[0]
+  reps = torch.cat([z1, z2], dim = 0)
+  sim_matrix = torch.matmul(reps, reps.T)
+  mask = torch.eye(batch_size * 2, dtype = torch.bool).to(z1.device)
+  sim_matrix = sim_matrix.masked_fill(mask, float('-inf'))
+  logits = sim_matrix / temperature
+  targets = torch.cat([torch.arange(batch_size, 2*batch_size), torch.arange(0, batch_size)]).to(z1.device)
+  loss = F.cross_entropy(logits, targets)
+  return loss
+
+
+miniCNN = CNN()
+simclr = simCLR(miniCNN)
+
+
+from os import pathconf_names
+# get vectors from final layer
+def extract(modelname, img_paths, device, batch_size = 5):
+  modelname.eval()
+  transform = transforms.Compose([transforms.Resize((256, 256)), transforms.ToTensor(), transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))])
+  features = []
+  with torch.no_grad():
+    for i in range(0, len(img_paths), batch_size):
+            batch_paths = img_paths[i:i+batch_size]
+            batch_images = []
+            for path in batch_paths:
+              # print(type(img_paths))
+              # break
+              image = Image.open(path).convert('RGB')
+              image = transform(image)
+              batch_images.append(image)
+            batch_tensor = torch.stack(batch_images).to(device)
+            feats = model(batch_tensor)
+            features.append(feats.cpu().numpy())
+  return np.concatenate(features)
+
+def get_model_name(name, batch_size, learning_rate, epoch):
+    path = "model_{0}_bs{1}_lr{2}_epoch{3}".format(name, batch_size, learning_rate, epoch)
+    return path
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = CNN().to(device)
+
+import os
+image_folder = '/content/drive/MyDrive/APS360/images'
+image_paths = [os.path.join(image_folder, f) for f in os.listdir(image_folder) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+# print(image_paths)
+features = extract(simclr, image_paths, device)
+
+savedir = '/content/drive/MyDrive/APS360/features'
+os.makedirs(savedir, exist_ok=True)
+savepath = os.path.join(savedir, 'features.npy')
+np.save(savepath, features)
+
+
+dataset = simCLRsample(image_paths, simclr_transform)
+dataloader = torch.utils.data.DataLoader(dataset, batch_size=10, shuffle=True)
+
+
+# train model to categorize rgb images
+def train(model, dataloader, batch_size, learningrate = 0.001, epochs = 10, temperature = 0.5):
+  torch.manual_seed(42)
+  optimizer = torch.optim.Adam(model.parameters(), lr = learningrate)
+
+  train_loss = np.zeros(epochs)
+  # test_loss = np.zeros(epochs)
+  start = time.time()
+  for epoch in range(epochs):
+    total_train_loss = 0.0
+    total_train_error = 0.0
+    total_epoch = 0
+    model.train()
+    for i, (x1, x2) in enumerate(dataloader, 0):
+        x1, x2 = x1.to(device), x2.to(device)
+        z1 = model(x1)
+        z2 = model(x2)
+        loss = lossfunction(z1, z2, temperature)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_train_loss += loss.item()
+        total_epoch += 1
+
+    train_loss[epoch] = float(total_train_loss) / total_epoch
+
+    print(("Epoch {}: Train loss: {} |").format(
+                   epoch + 1,
+                   train_loss[epoch]))
+    model_path = get_model_name(model.name, batch_size, learningrate, epoch)
+    torch.save(model.state_dict(), model_path)
+  print('Training Complete')
+  end = time.time()
+  print("Total Time: {:.2f} seconds".format(end - start))
+  epochs = np.arange(1, epochs + 1)
+  np.savetxt("{}_train_loss.csv".format(model_path), train_loss)
+
+
+train(simclr, dataloader, 20, 0.001, 20, 0.5)
+
+
+# sort images into 32 clusters
+k = 32
+features = extract(simclr, image_paths, device)
+kmeans = KMeans(n_clusters=k, random_state=42)
+cluster_labels = kmeans.fit_predict(features)
+print(f"Assigned labels: {cluster_labels}")
+print(image_paths[0])
+print(len(image_paths), len(cluster_labels))
+output = '/content/drive/MyDrive/APS360/APS360Project/miniCNN/contrastiveclusters'
+os.makedirs(output, exist_ok=True)
+for imgpath, label in zip(image_paths, cluster_labels):
+  clusterfolder = os.path.join(output, f"cluster_{label}")
+  os.makedirs(clusterfolder, exist_ok=True)
+  filename = os.path.basename(imgpath)
+  dest = os.path.join(clusterfolder, filename)
+  shutil.copy(imgpath, dest)
+
+
